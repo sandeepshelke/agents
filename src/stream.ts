@@ -2634,9 +2634,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         }
       }
 
+      const responseIndex = existingContent?.response_index;
       contentParts[index] = {
         type: ContentTypes.TOOL_CALL,
         tool_call: newToolCall,
+        ...(responseIndex != null && { response_index: responseIndex }),
       };
       indexContentPart(index, contentParts[index]);
       indexedContentLength = Math.max(indexedContentLength, index + 1);

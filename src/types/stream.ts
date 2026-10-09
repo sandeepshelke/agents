@@ -504,6 +504,12 @@ export type ToolCallPart = {
 export type ToolCallContent = {
   type: ContentTypes.TOOL_CALL;
   tool_call?: ToolCallPart;
+  /**
+   * Position of the model response (AI message) that issued this call within
+   * the run's messages. Calls sharing a value came from one response. Lives on
+   * the part, not on `tool_call`, so it never reaches the provider request.
+   */
+  response_index?: number;
 };
 
 export type ToolResultContent = {

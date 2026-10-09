@@ -81,6 +81,7 @@ import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isResponseIndex } from './toolCallResponses';
 import { emitAgentLog } from '@/utils/events';
 import {
   createToolHistoryPreparation,
@@ -1601,6 +1602,11 @@ function formatAssistantMessage(
     );
   };
   let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
+  /** Response tag of the calls on `message`; stale once `lastAIMessage` moves on. */
+  let lastToolResponse: {
+    message: RoleBearingMessage<AIMessage>;
+    index: number;
+  } | null = null;
   let hasReasoning = false;
   let pendingReasoningContent = '';
   let pendingReasoningSourcePartIndices: number[] = [];
@@ -1924,7 +1930,16 @@ function formatAssistantMessage(
           continue;
         }
 
-        if (!lastAIMessage) {
+        const responseIndex = (part as ToolCallContent).response_index;
+        const callResponseIndex = isResponseIndex(responseIndex)
+          ? responseIndex
+          : undefined;
+        const startsNewResponse =
+          callResponseIndex != null &&
+          lastToolResponse?.message === lastAIMessage &&
+          lastToolResponse.index !== callResponseIndex;
+
+        if (!lastAIMessage || startsNewResponse) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
           lastAIMessage = appendAIMessage(
             '',
@@ -1982,6 +1997,12 @@ function formatAssistantMessage(
             lastAIMessage.tool_calls = [];
           }
           lastAIMessage.tool_calls.push(tool_call as ToolCall);
+        }
+        if (callResponseIndex != null) {
+          lastToolResponse = {
+            message: lastAIMessage,
+            index: callResponseIndex,
+          };
         }
 
         appendFormattedMessage(
