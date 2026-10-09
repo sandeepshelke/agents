@@ -14,11 +14,6 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
-  OrderedToolHistoryProjection,
-  ToolHistoryPreparation,
-  ToolHistoryCallMirrors,
-} from './toolHistoryProjection';
-import type {
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
@@ -37,6 +32,11 @@ import type {
   CompactionSemanticIndexEntry,
   CompactionSemanticIndexSnapshot,
 } from '@/types';
+import type {
+  OrderedToolHistoryProjection,
+  ToolHistoryPreparation,
+  ToolHistoryCallMirrors,
+} from './toolHistoryProjection';
 import type {
   ProviderMessageAttribution,
   ProviderMessageProvenancePart,
@@ -71,6 +71,11 @@ import {
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
 import {
+  createToolHistoryPreparation,
+  isToolHistoryCallMirror,
+  recordToolHistoryCallMirror,
+} from './toolHistoryProjection';
+import {
   Providers,
   ContentTypes,
   Constants,
@@ -78,16 +83,11 @@ import {
 } from '@/common';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
-import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { isResponseIndex } from './toolCallResponses';
 import { emitAgentLog } from '@/utils/events';
-import {
-  createToolHistoryPreparation,
-  isToolHistoryCallMirror,
-  recordToolHistoryCallMirror,
-} from './toolHistoryProjection';
 
 interface MediaMessageParams {
   message: {
@@ -1941,10 +1941,30 @@ function formatAssistantMessage(
 
         if (!lastAIMessage || startsNewResponse) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
-          lastAIMessage = appendAIMessage(
-            '',
-            createSourceProvenanceBuilder(sourcePartIndices, 'model')
-          );
+          if (currentContent.length === 0) {
+            lastAIMessage = appendAIMessage(
+              '',
+              createSourceProvenanceBuilder(sourcePartIndices, 'model')
+            );
+          } else {
+            // Text written before the call belongs to the same response.
+            let content: MessageContent = '';
+            let textOnly = true;
+            for (const pending of currentContent) {
+              if (pending.type !== ContentTypes.TEXT) {
+                textOnly = false;
+                break;
+              }
+              content += getTextContent(pending);
+            }
+            if (!textOnly) {
+              content = toLangChainContent(currentContent);
+            }
+            appendCurrentContentProvenance(sourcePartIndices, 'model');
+            lastAIMessage = appendAIMessage(content, currentContentProvenance);
+            currentContent = [];
+            currentContentProvenance = createProviderMessageProvenanceBuilder();
+          }
         } else {
           attachPendingReasoningContent(lastAIMessage);
           appendSourcePartIndices(lastAIMessage, 'model', sourcePartIndices);
@@ -3696,9 +3716,7 @@ function getSyntheticProviderContextProvenanceParts(
     }
     for (const attribution of source.additionalAttributions ?? []) {
       const sourceMessageId =
-        sourceMessageIds.length === 1
-          ? sourceMessageIds[0]
-          : undefined;
+        sourceMessageIds.length === 1 ? sourceMessageIds[0] : undefined;
       const retainedSourceId =
         retainedSourceIds.size === 1
           ? retainedSourceIds.values().next().value

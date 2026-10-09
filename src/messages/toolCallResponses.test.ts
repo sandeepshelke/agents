@@ -1,16 +1,17 @@
 import { AIMessage, ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { Providers, StepTypes, GraphEvents, ContentTypes } from '@/common';
-import { formatAgentMessages } from './format';
 import {
   isResponseIndex,
   MAX_RESPONSE_INDEX,
   tagToolCallResponses,
 } from './toolCallResponses';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
+import { Providers, StepTypes, GraphEvents, ContentTypes } from '@/common';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { getProviderMessageProvenance } from './provenance';
 import { createContentAggregator } from '@/stream';
+import { formatAgentMessages } from './format';
 
 type Call = { id: string; name: string; args: Record<string, string> };
 
@@ -613,5 +614,307 @@ describe('response_index hardening', () => {
       { type: ContentTypes.TEXT, text: 'hi' },
     ] as t.MessageContentComplex[];
     expect(tagToolCallResponses(parts, runMessages)).toBe(0);
+  });
+});
+
+describe('text written before a response calls', () => {
+  const text = (s: string): t.MessageContentComplex =>
+    ({ type: ContentTypes.TEXT, text: s }) as t.MessageContentComplex;
+  const textFor = (s: string, ids: string[]): t.MessageContentComplex =>
+    ({
+      type: ContentTypes.TEXT,
+      text: s,
+      tool_call_ids: ids,
+    }) as t.MessageContentComplex;
+  const think = (s: string): t.MessageContentComplex =>
+    ({ type: ContentTypes.THINK, think: s }) as t.MessageContentComplex;
+  const image = (): t.MessageContentComplex =>
+    ({
+      type: ContentTypes.IMAGE_URL,
+      image_url: { url: 'https://example.com/a.png' },
+    }) as t.MessageContentComplex;
+
+  const describeMessages = (messages: BaseMessage[]): unknown[] =>
+    messages.map((m) => {
+      if (m instanceof ToolMessage) {
+        return ['tool', m.tool_call_id];
+      }
+      if (m instanceof AIMessage) {
+        return ['ai', m.content, callIdsOf(m)];
+      }
+      return ['user'];
+    });
+
+  describe.each([[undefined], [Providers.ANTHROPIC]])(
+    'rebuild (provider: %s)',
+    (provider) => {
+      const aiText = (m: BaseMessage): string => {
+        const { content } = m as AIMessage;
+        if (typeof content === 'string') {
+          return content;
+        }
+        return (content as Array<{ type: string; text?: string }>)
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text)
+          .join('');
+      };
+
+      it('keeps the preamble on the first assistant message of a tagged response', () => {
+        const parts = [
+          text('PREAMBLE'),
+          toolPart('a', 0),
+          toolPart('b', 0),
+          toolPart('c', 1),
+          text('FINAL'),
+        ];
+        const messages = rebuild(parts, provider);
+        expect(shapeOf(messages)).toEqual([
+          'user',
+          'ai:a,b',
+          'tool:a:out-a',
+          'tool:b:out-b',
+          'ai:c',
+          'tool:c:out-c',
+          'ai:',
+        ]);
+        expect(aiText(messages[1])).toBe('PREAMBLE');
+        expect(aiText(messages[4])).toBe('');
+        expect(aiText(messages[6])).toBe('FINAL');
+      });
+
+      it('keeps text between rounds on the following call', () => {
+        const parts = [
+          toolPart('a', 0),
+          text('MID'),
+          toolPart('b', 1),
+          text('FINAL'),
+        ];
+        const messages = rebuild(parts, provider);
+        expect(shapeOf(messages)).toEqual([
+          'user',
+          'ai:a',
+          'tool:a:out-a',
+          'ai:b',
+          'tool:b:out-b',
+          'ai:',
+        ]);
+        expect(aiText(messages[1])).toBe('');
+        expect(aiText(messages[3])).toBe('MID');
+        expect(aiText(messages[5])).toBe('FINAL');
+      });
+
+      it('concatenates text parts exactly', () => {
+        const first = '\n  leading 日本語 😀 \\n "q" ';
+        const second = '\t{"k":"\\u00e9"}\n\n';
+        const messages = rebuild(
+          [text(first), text(second), toolPart('a', 0), text(' FINAL\n')],
+          provider
+        );
+        expect(shapeOf(messages)).toEqual([
+          'user',
+          'ai:a',
+          'tool:a:out-a',
+          'ai:',
+        ]);
+        expect(aiText(messages[1])).toBe(`${first}${second}`);
+        expect(aiText(messages[3])).toBe(' FINAL\n');
+      });
+
+      it('moves an untagged preamble to the first call and groups legacy calls as before', () => {
+        const messages = rebuild(
+          [text('PREAMBLE'), toolPart('a'), toolPart('b'), text('FINAL')],
+          provider
+        );
+        expect(shapeOf(messages)).toEqual([
+          'user',
+          'ai:a,b',
+          'tool:a:out-a',
+          'tool:b:out-b',
+          'ai:',
+        ]);
+        expect(aiText(messages[1])).toBe('PREAMBLE');
+        expect(aiText(messages[4])).toBe('FINAL');
+      });
+
+      it('leaves an empty first assistant message when nothing precedes the call', () => {
+        const messages = rebuild([toolPart('a', 0)], provider);
+        expect(aiText(messages[1])).toBe('');
+      });
+
+      it('treats reasoning before the preamble like the tool_call_ids path', () => {
+        const options = { provider, preserveReasoningContent: true };
+        const build = (parts: t.MessageContentComplex[]): BaseMessage[] =>
+          formatAgentMessages(
+            [
+              { role: 'user', content: 'question' },
+              { role: 'assistant', content: parts as never },
+            ],
+            undefined,
+            undefined,
+            undefined,
+            options
+          ).messages;
+        const plain = build([
+          think('why'),
+          text('PRE'),
+          toolPart('a', 0),
+          text('FINAL'),
+        ]);
+        const legacy = build([
+          think('why'),
+          textFor('PRE', ['a']),
+          toolPart('a', 0),
+          text('FINAL'),
+        ]);
+        expect(describeMessages(plain)).toEqual(describeMessages(legacy));
+        expect((plain[1] as AIMessage).additional_kwargs).toEqual(
+          (legacy[1] as AIMessage).additional_kwargs
+        );
+      });
+
+      it('treats non-text blocks like the tool_call_ids path', () => {
+        const plain = rebuild(
+          [text('PRE'), image(), toolPart('a', 0), text('FINAL')],
+          provider
+        );
+        const legacy = rebuild(
+          [text('PRE'), image(), textFor('', ['a']), toolPart('a', 0)],
+          provider
+        );
+        const plainAi = plain[1] as AIMessage;
+        const legacyAi = legacy[1] as AIMessage;
+        const withoutCalls = (m: AIMessage): unknown[] =>
+          (m.content as Array<{ type: string }>).filter(
+            (b) => b.type !== 'tool_use'
+          );
+        expect(withoutCalls(plainAi)).toEqual(
+          withoutCalls(legacyAi).filter(
+            (b) => (b as { text?: string }).text !== ''
+          )
+        );
+        expect(callIdsOf(plainAi)).toEqual(['a']);
+      });
+
+      it('does not modify or reorder the source parts', () => {
+        const parts = [
+          text('PREAMBLE'),
+          toolPart('a', 0),
+          text('MID'),
+          toolPart('b', 1),
+          text('FINAL'),
+        ];
+        const before = JSON.stringify(parts);
+        rebuild(parts, provider);
+        expect(JSON.stringify(parts)).toBe(before);
+      });
+    }
+  );
+
+  describe('model-facing request prefix with normal streamed text', () => {
+    const args = { q: 'naïve 日本語 😀 "x" \\ \n' };
+    const rc = (id: string): Call => ({ id, name: 'lookup', args });
+    const result = (id: string): ToolMessage =>
+      new ToolMessage({
+        tool_call_id: id,
+        name: 'lookup',
+        content: `résultat ${id} \n 日本語`,
+      });
+    const part = (id: string, index: number): t.MessageContentComplex =>
+      ({
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id,
+          name: 'lookup',
+          args: JSON.stringify(args),
+          output: `résultat ${id} \n 日本語`,
+        },
+        response_index: index,
+      }) as t.MessageContentComplex;
+
+    const run: BaseMessage[] = [
+      new HumanMessage('question'),
+      new AIMessage({
+        content: 'Looking “up” 日本語\n',
+        tool_calls: [rc('a')],
+      }),
+      result('a'),
+      new AIMessage({ content: ' then more ', tool_calls: [rc('b'), rc('c')] }),
+      result('b'),
+      result('c'),
+      new AIMessage({ content: '', tool_calls: [rc('d')] }),
+      result('d'),
+    ];
+    const saved = (): t.MessageContentComplex[] => [
+      text('Looking “up” 日本語\n'),
+      part('a', 0),
+      text(' then more '),
+      part('b', 1),
+      part('c', 1),
+      part('d', 2),
+      text('final answer'),
+    ];
+
+    it.each([
+      [
+        'openai',
+        (m: BaseMessage[]) => _convertMessagesToOpenAIParams(m, 'gpt-4o'),
+        undefined,
+      ],
+      [
+        'anthropic',
+        (m: BaseMessage[]) => _convertMessagesToAnthropicPayload(m),
+        Providers.ANTHROPIC,
+      ],
+    ] as Array<[string, (m: BaseMessage[]) => unknown, Providers | undefined]>)(
+      'serializes to the run prefix (%s)',
+      (_name, serialize, provider) => {
+        const rebuilt = rebuild(persist(saved()), provider);
+        expect(rebuilt).toHaveLength(run.length + 1);
+        expect(JSON.stringify(serialize(rebuilt.slice(0, run.length)))).toBe(
+          JSON.stringify(serialize([rebuilt[0], ...run.slice(1)]))
+        );
+        expect(serialize([rebuilt[0], rebuilt[run.length]])).toEqual(
+          serialize(rebuild([text('final answer')], provider))
+        );
+      }
+    );
+
+    it('tracks preambles with their calls and excludes them from the final message', () => {
+      const { messages } = formatAgentMessages([
+        { role: 'user', content: 'question' },
+        { role: 'assistant', messageId: 'src', content: saved() as never },
+      ]);
+      const indices = messages.map((m) =>
+        (
+          getProviderMessageProvenance(m)?.parts.flatMap(
+            (p) => p.sourceContentPartIndices ?? []
+          ) ?? []
+        ).sort((x, y) => x - y)
+      );
+      expect(shapeOf(messages)).toEqual(
+        [
+          'user',
+          'ai:a',
+          'tool:a:out-a',
+          'ai:b,c',
+          'tool:b:out-b',
+          'tool:c:out-c',
+          'ai:d',
+          'tool:d:out-d',
+          'ai:',
+        ].map((s) => s.replace(/out-(\w)/, 'résultat $1 \n 日本語'))
+      );
+      expect(indices[1]).toEqual([0, 1]);
+      expect(indices[3]).toEqual([2, 3, 4]);
+      expect(indices[6]).toEqual([5]);
+      expect(indices[8]).toEqual([6]);
+      for (const message of messages.slice(1)) {
+        expect(
+          getProviderMessageProvenance(message)?.parts.every(
+            (part) => part.sourceMessageId === 'src'
+          )
+        ).toBe(true);
+      }
+    });
   });
 });
