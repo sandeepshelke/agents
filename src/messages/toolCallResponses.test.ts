@@ -3,7 +3,13 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { Providers, StepTypes, GraphEvents, ContentTypes } from '@/common';
 import { formatAgentMessages } from './format';
-import { tagToolCallResponses } from './toolCallResponses';
+import {
+  isResponseIndex,
+  MAX_RESPONSE_INDEX,
+  tagToolCallResponses,
+} from './toolCallResponses';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { createContentAggregator } from '@/stream';
 
 type Call = { id: string; name: string; args: Record<string, string> };
@@ -437,5 +443,175 @@ describe('content aggregator', () => {
     const part = contentParts[0] as t.ToolCallContent;
     expect(part.response_index).toBe(7);
     expect(part.tool_call?.output).toBe('o');
+  });
+});
+
+describe('tool rounds model-facing request prefix', () => {
+  const tricky = {
+    q: 'naïve 日本語 😀 "quoted" \\ back\nline\ttab </tag> {"k":[1,2]}',
+    n: 1,
+  };
+  const trickyOutput = 'résultat: "ok" \\ \n 日本語 😀 {"a":"b"}';
+
+  const richCall = (id: string) => ({
+    id,
+    name: 'lookup',
+    args: { ...tricky, id },
+  });
+  const richResult = (id: string): ToolMessage =>
+    new ToolMessage({
+      tool_call_id: id,
+      name: 'lookup',
+      content: `${trickyOutput} ${id}`,
+    });
+  const richPart = (id: string): t.MessageContentComplex =>
+    ({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id,
+        name: 'lookup',
+        args: JSON.stringify({ ...tricky, id }),
+        output: `${trickyOutput} ${id}`,
+      },
+    }) as t.MessageContentComplex;
+  const textPart = (s: string, ids?: string[]): t.MessageContentComplex =>
+    ({
+      type: ContentTypes.TEXT,
+      text: s,
+      ...(ids != null && { tool_call_ids: ids }),
+    }) as t.MessageContentComplex;
+
+  /** Rounds: parallel pair, text-led single call, then a lone call; then final text. */
+  const run: BaseMessage[] = [
+    new HumanMessage('question'),
+    new AIMessage({ content: '', tool_calls: [richCall('a'), richCall('b')] }),
+    richResult('a'),
+    richResult('b'),
+    new AIMessage({
+      content: 'Let me check “this” 日本語',
+      tool_calls: [richCall('c')],
+    }),
+    richResult('c'),
+    new AIMessage({ content: '', tool_calls: [richCall('d')] }),
+    richResult('d'),
+  ];
+  const savedParts = (): t.MessageContentComplex[] => [
+    richPart('a'),
+    richPart('b'),
+    textPart('Let me check “this” 日本語', ['c']),
+    richPart('c'),
+    richPart('d'),
+    textPart('final answer'),
+  ];
+
+  const serializers: Array<
+    [string, (m: BaseMessage[]) => unknown, Providers?]
+  > = [
+    ['openai', (m) => _convertMessagesToOpenAIParams(m, 'gpt-4o'), undefined],
+    [
+      'anthropic',
+      (m) => _convertMessagesToAnthropicPayload(m),
+      Providers.ANTHROPIC,
+    ],
+  ];
+
+  it.each(serializers)(
+    'tagged rebuild serializes to the run prefix (%s)',
+    (_name, serialize, provider) => {
+      const parts = savedParts();
+      expect(tagToolCallResponses(parts, run)).toBe(4);
+      const rebuilt = rebuild(persist(parts), provider);
+      expect(JSON.stringify(rebuilt)).not.toContain('response_index');
+      expect(JSON.stringify(rebuilt[rebuilt.length - 1].content)).toContain(
+        'final answer'
+      );
+      const prefix = rebuilt.slice(0, run.length);
+      // The rebuilt user turn is shaped by the host, not by the tool rounds under test.
+      expect(serialize(prefix)).toEqual(
+        serialize([rebuilt[0], ...run.slice(1)])
+      );
+      expect(JSON.stringify(serialize(prefix))).not.toContain('response_index');
+    }
+  );
+
+  it.each(serializers)(
+    'untagged rebuild differs from the run prefix (%s)',
+    (_name, serialize, provider) => {
+      const rebuilt = rebuild(persist(savedParts()), provider);
+      expect(serialize(rebuilt.slice(0, run.length))).not.toEqual(
+        serialize([rebuilt[0], ...run.slice(1)])
+      );
+    }
+  );
+});
+
+describe('response_index hardening', () => {
+  const part = (
+    id: string,
+    response_index?: unknown
+  ): t.MessageContentComplex =>
+    ({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: { id, name: 'lookup', args: '{}', output: id },
+      ...(response_index !== undefined && { response_index }),
+    }) as t.MessageContentComplex;
+
+  it.each([
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 2],
+    ['above the cap', MAX_RESPONSE_INDEX + 1],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['string', '3'],
+    ['NaN', Number.NaN],
+  ])('rejects a %s tag', (_label, value) => {
+    expect(isResponseIndex(value)).toBe(false);
+  });
+
+  it('accepts the largest allowed tag', () => {
+    expect(isResponseIndex(MAX_RESPONSE_INDEX)).toBe(true);
+    expect(isResponseIndex(0)).toBe(true);
+  });
+
+  it('ignores a malformed retained tag instead of offsetting by it', () => {
+    const run = buildRun([['b'], ['c']]);
+    const parts = [
+      part('x', Number.MAX_SAFE_INTEGER + 2),
+      part('b'),
+      part('c'),
+    ];
+    tagToolCallResponses(parts, run);
+    expect(responseIndexes(parts)).toEqual([Number.MAX_SAFE_INTEGER + 2, 1, 3]);
+  });
+
+  it('leaves parts untouched when a retained tag leaves no room for the run', () => {
+    const run = buildRun([['b'], ['c']]);
+    const parts = [part('x', MAX_RESPONSE_INDEX), part('b'), part('c')];
+    expect(tagToolCallResponses(parts, run)).toBe(0);
+    expect(responseIndexes(parts)).toEqual([
+      MAX_RESPONSE_INDEX,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('never produces colliding tags for distinct rounds', () => {
+    const run = buildRun([['b'], ['c']]);
+    const parts = [part('x', 2 ** 30), part('b'), part('c')];
+    tagToolCallResponses(parts, run);
+    const [, b, c] = responseIndexes(parts);
+    expect(b).not.toBe(c);
+    expect(b).toBeGreaterThan(2 ** 30);
+  });
+
+  it('does not read run messages when there are no tool_call parts', () => {
+    const runMessages = new Proxy([] as BaseMessage[], {
+      get: () => {
+        throw new Error('run messages must not be read');
+      },
+    });
+    const parts = [
+      { type: ContentTypes.TEXT, text: 'hi' },
+    ] as t.MessageContentComplex[];
+    expect(tagToolCallResponses(parts, runMessages)).toBe(0);
   });
 });
